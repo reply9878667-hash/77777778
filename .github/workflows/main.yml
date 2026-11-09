@@ -1,0 +1,128 @@
+name: Build LockDistra APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Sirf yahan naam badalna ho to badlo - APK ka file name + artifact name yahin se aata hai.
+  APK_NAME: LockDistra
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find project (unzip only if needed)
+        run: |
+          # 1) Pehle repo me seedha project dhundo (sabse upar wala settings.gradle.kts)
+          SETTINGS=$(find . -name settings.gradle.kts -not -path './.git/*' -printf '%d %p\n' | sort -n | head -n 1 | cut -d' ' -f2-)
+
+          # 2) Nahi mila to repo ke root ki sabse nayi zip kholo (zip ka naam kuch bhi ho sakta hai)
+          if [ -z "$SETTINGS" ]; then
+            ZIP=$(ls -t ./*.zip 2>/dev/null | head -n 1)
+            if [ -z "$ZIP" ]; then
+              echo "::error::Project files ya zip repo me nahi mila (root me .zip upload karo ya project files extract karke upload karo)"
+              exit 1
+            fi
+            echo "Unzipping: $ZIP"
+            rm -rf project
+            unzip -q "$ZIP" -d project -x '__MACOSX/*'
+            SETTINGS=$(find project -name settings.gradle.kts -printf '%d %p\n' | sort -n | head -n 1 | cut -d' ' -f2-)
+            if [ -z "$SETTINGS" ]; then
+              echo "::error::Zip ke andar settings.gradle.kts nahi mila"
+              exit 1
+            fi
+          fi
+
+          DIR=$(dirname "$SETTINGS")
+          echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
+          echo "Project folder: $DIR"
+
+          if [ ! -f "$DIR/app/build.gradle.kts" ]; then
+            echo "::error::$DIR/app/build.gradle.kts nahi mila - zip ka structure check karo"
+            exit 1
+          fi
+          grep -E 'rootProject.name|include\(' "$DIR/settings.gradle.kts" || true
+          grep -E 'namespace|applicationId|versionName|versionCode' "$DIR/app/build.gradle.kts" || true
+          [ -f "$DIR/signing/rewire-debug.jks" ] && echo "Debug keystore: OK" || echo "WARNING: signing/rewire-debug.jks nahi mila - random debug key banegi (Google sign-in SHA-1 badal jayega)"
+
+      - name: Fix build.gradle.kts (java.util import, only if missing)
+        run: |
+          F="$PROJECT_DIR/app/build.gradle.kts"
+          if grep -q 'Properties()' "$F" && ! grep -q '^import java.util.Properties' "$F"; then
+            sed -i 's/java\.util\.Properties()/Properties()/g' "$F"
+            sed -i '1i import java.util.Properties' "$F"
+            echo "import add kiya"
+          else
+            echo "Fix ki zarurat nahi"
+          fi
+          head -n 3 "$F"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Build APK
+        run: |
+          set -o pipefail
+          cd "$PROJECT_DIR"
+          gradle assembleDebug --console=plain --stacktrace \
+            -Dorg.gradle.jvmargs="-Xmx4g -Dfile.encoding=UTF-8" \
+            -Pkotlin.daemon.jvmargs="-Xmx2g" \
+            2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+          APK=$(find app/build/outputs/apk/debug -name '*.apk' | head -n 1)
+          if [ -z "$APK" ]; then
+            echo "::error::APK build hui hi nahi (output folder khali)"
+            exit 1
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$APK" "$GITHUB_WORKSPACE/out/${APK_NAME}.apk"
+          ls -lh "$GITHUB_WORKSPACE/out"
+
+      - name: Show errors (only when build fails)
+        if: failure()
+        run: |
+          {
+            echo '## Build errors'
+            echo '```'
+            grep -h -E '^e: |What went wrong|Execution failed|FAILED|error:' -A4 "$GITHUB_WORKSPACE"/build.log | head -n 80
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build log (only when build fails)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APK_NAME }}-APK
+          path: out/${{ env.APK_NAME }}.apk
+          if-no-files-found: error
